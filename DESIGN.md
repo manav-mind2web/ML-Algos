@@ -1,271 +1,271 @@
-# Window/Door Detection Review Pipeline — Design
+# Window/Door Detection — Template-Matching Pipeline (Plan v2)
 
 ## Goal
 
-Fix imperfect detections from the HF-hosted detector by having Claude Opus
-vision review the image and **directly edit `response.json`** so that
-re-annotating the raw image with the edited JSON produces a perfect overlay.
+Replace the lossy HF detector with a deterministic, near-free, sub-second
+pipeline that uses the **type templates already in the payload** as the
+detection signal. Claude vision runs only as a fallback verifier for
+ambiguous cases.
 
-Scope: front, side, and back views of building exteriors. No top views.
-Classes: `window`, `door`, `garage_door` (with `type` subfield).
+Inputs are unchanged: the HF payload already contains
+`building_image`, `window_types[]`, `door_types[]`, `garage_types[]`.
+
+Output is the same `response.json` schema you have today, so nothing
+downstream changes.
 
 ## End-to-end flow
 
 ```
-raw_image.png
+payload.json
+   │  building_image (1477×385)
+   │  window_types[0..1]   (~80×60, RGBA)
+   │  door_types[0]        (~55×50, RGBA)
+   │  garage_types[0]      (~223×102, RGBA)
    │
    ▼
-[1] HF detector  ──────────────▶  response.json  (v0, imperfect)
-   │                                   │
-   ▼                                   ▼
-[2] annotate(raw, v0)  ──────▶  annotated_v0.png
+[1] Pre-process
+       • decode all images, grayscale + Canny edges
+       • build mask from each template's alpha channel
+       • record per-template native size
    │
    ▼
-[3] Claude review agent (Opus vision)
-       inputs : raw_image.png, annotated_v0.png, response.json (v0)
-       tools  : crop_region, annotate_image, write_response_json
-       output : response.json (v1, corrected)
+[2] Multi-scale template matcher (cv2.matchTemplate, TM_CCOEFF_NORMED)
+       for each template T:
+         for scale s in 0.70 .. 1.40 step 0.05:
+           score_map = matchTemplate(building_edges, resize(T_edges, s),
+                                      mask=resize(T_mask, s))
+           collect (x, y, s, score) where score ≥ τ_T
    │
    ▼
-[4] annotate(raw, v1)  ──────▶  annotated_v1.png   ← final deliverable
+[3] Per-class NMS (IoU thresholds: windows 0.4, garage 0.4, doors 0.3)
+       merge candidates from all scales+templates of the same class
+       winning template name → `type`
    │
    ▼
-[5] self-check pass (Claude looks at annotated_v1.png only,
-                     confirms every box is tight & no openings missed.
-                     If not, loop back to [3] with max 2 retries.)
+[4] Coverage check
+       compute density grid 256×256
+       find "suspect regions": image areas with strong edge content
+       but no detection inside
+   │
+   ▼
+[5] Claude verifier  (only on residuals — usually 0–3 calls per image)
+       (a) crop each suspect region → ask: "is there a window/door here?
+            if yes, give a bbox in crop coords + type"
+       (b) for low-score matches (0.55–0.75 band), crop and ask:
+            "confirm this is class X, type Y"
+       (c) on type ties (two templates scored within 0.03), crop and ask:
+            "which of these two reference crops does this look like?"
+   │
+   ▼
+[6] Assemble response.json (same schema as today)
+       + review_meta { tier1_count, tier2_calls, elapsed_ms, ... }
 ```
 
-The agent **edits JSON, not pixels.** The annotated image is regenerated
-deterministically from the JSON after every edit. This guarantees the
-image and the JSON can never drift apart.
+Tier 1 is expected to handle 90–95% of detections at ~50 ms per image,
+fully deterministic. Tier 2 fires only when Tier 1 is uncertain.
+
+## Why this beats the alternatives for *this* data
+
+| Approach              | Cost/img | Latency | Uses templates? | Notes                                   |
+|-----------------------|----------|---------|-----------------|------------------------------------------|
+| HF detector (current) | $        | ~1s     | no              | Misses things — the problem we're solving |
+| Claude vision only    | $$$      | ~10s    | no              | Expensive, slow                          |
+| SAM 2 + Claude        | $$       | ~5s     | no              | Returns masks for everything; needs filtering |
+| **Template matching + Claude verifier** | ~$0 | ~0.1s | **yes** | This plan                                |
 
 ## Repo layout
 
 ```
 ML-Algos/
-├── DESIGN.md                       ← this file
+├── DESIGN.md                       (this file)
 ├── pyproject.toml
 ├── src/
-│   └── review/
+│   └── detect/
 │       ├── __init__.py
-│       ├── config.py               ← thresholds, model IDs, paths
-│       ├── schema.py               ← pydantic models for response.json
-│       ├── hf_client.py            ← calls the HF endpoint
-│       ├── annotate.py             ← raw + JSON → annotated PNG
-│       ├── crop.py                 ← bbox → cropped PIL.Image
-│       ├── prompts.py              ← all prompt strings
-│       ├── agent.py                ← Claude Agent SDK orchestration
-│       ├── tools.py                ← SDK tool definitions
-│       └── reconcile.py            ← IoU diff + JSON merge helpers
+│       ├── config.py               # thresholds, scale range, NMS IoU
+│       ├── schema.py               # pydantic models, matches response.json
+│       ├── payload.py              # decode payload.json → numpy arrays
+│       ├── preprocess.py           # grayscale + edges + masks
+│       ├── matcher.py              # multi-scale matchTemplate + NMS
+│       ├── coverage.py             # suspect-region finder for Tier 2
+│       ├── verifier.py             # Claude vision calls (Tier 2)
+│       ├── prompts.py
+│       └── assemble.py             # → response.json
 ├── tests/
-│   ├── fixtures/                   ← sample image + response pairs
-│   └── test_reconcile.py
+│   ├── fixtures/
+│   │   └── sample_payload.json     # the one you uploaded
+│   ├── test_matcher.py
+│   ├── test_nms.py
+│   └── test_end_to_end.py
 └── examples/
-    └── run_review.py               ← CLI entrypoint
+    └── run_detect.py               # CLI: payload.json → response.json
 ```
 
-## response.json schema (locked)
+## Algorithm specifics
 
-Same shape as the HF response you pasted. Three top-level groups
-(`windows`, `doors`, `garage_doors`), each with `detections[]` and
-`summary{}`. Every detection:
+### Edge-based matching (not pixel-based)
+
+Raw pixel match on architectural drawings is brittle to anti-aliasing
+and stroke width. Pipeline:
+
+1. `building_gray = cv2.cvtColor(building, COLOR_RGB2GRAY)`
+2. `building_edges = cv2.Canny(building_gray, 50, 150)`
+3. For each template:
+   - extract alpha mask if RGBA, else binarize via Otsu
+   - `T_edges = cv2.Canny(T_gray, 50, 150)`
+4. Match `T_edges` against `building_edges` using `TM_CCOEFF_NORMED` with
+   the resized mask passed as the `mask=` arg (so transparent template
+   pixels don't contribute to the correlation).
+
+This makes matching invariant to fill color and small stroke variations
+while still being fully deterministic.
+
+### Scale sweep
+
+- Range: `0.70 → 1.40`, step `0.05` (15 scales).
+- Justification: your sample shows building windows at ~99×75 vs
+  template 81×62 → 1.21× scale. ±30% covers the realistic range for the
+  same drawing program output. Configurable in `config.py`.
+- For each scale, keep all peaks above `τ_T` (default `0.70`).
+
+### NMS
+
+- Per class, across all templates and scales.
+- IoU thresholds: `windows=0.4`, `garage_doors=0.4`, `doors=0.3` (doors
+  are narrow; 0.5 mis-merges adjacent doors).
+- On overlap, keep the higher-scoring candidate. Its winning template
+  becomes the detection's `type`.
+
+### Coverage / suspect-region finder
+
+After NMS, build a binary mask of "covered" pixels (the union of
+detected bboxes, dilated by 10 px). Find connected components of
+high-edge-density pixels (Canny output, dilated by 5 px) that lie
+**outside** the covered mask. Components with area > 1500 px² → suspect
+regions sent to Tier 2.
+
+This is what catches openings the templates don't cover.
+
+### Tier 2 — Claude verifier
+
+Three call types, all with `cache_control` on the building image so the
+image uploads once per request batch:
+
+1. **Suspect-region check** — `crop = building[region]`, prompt: *"Is
+   this crop a window, door, garage door, or none of those? If yes,
+   bbox within the crop and short reason."*
+2. **Low-score confirm** — for each Tier-1 candidate with score in
+   `[0.55, 0.75]`, crop ±10 px and ask: *"Confirm class=X, type=Y."*
+3. **Type tie-break** — when two templates score within 0.03, send the
+   crop + both template crops and ask: *"Which template does this
+   match — A or B?"*
+
+Calls run in `asyncio.gather` bounded by `Semaphore(8)`. Hard cap of
+10 Tier-2 calls per image, logged.
+
+## Config defaults (`config.py`)
+
+```python
+SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.70, 1.40, 0.05
+MATCH_THRESHOLD = 0.70                    # τ_T
+LOW_SCORE_BAND  = (0.55, 0.75)            # → Tier 2 confirm
+TIE_DELTA       = 0.03                    # → Tier 2 type tie-break
+IOU_NMS         = {"window": 0.4, "garage_door": 0.4, "door": 0.3}
+SUSPECT_MIN_AREA = 1500
+TIER2_MAX_CALLS  = 10
+TIER2_MODEL      = "claude-haiku-4-5-20251001"   # cheap is enough
+```
+
+Thresholds are tuned on the test fixtures; never hardcoded inline.
+
+## response.json schema (additive)
+
+Same shape as today, plus per-detection provenance:
 
 ```json
 {
   "id": 1,
-  "bbox": [x1, y1, x2, y2],     // pixel coords, absolute
-  "confidence": 0.87,
-  "class": "window",            // window | door | garage_door
-  "type": "Type 1",             // class-specific enum
-  "source": "hf" | "claude_edit" | "claude_add",   // NEW, optional
-  "edit_reason": "tightened bbox; was 8px too wide on the right"  // NEW, optional
+  "bbox": [173, 151, 272, 226],
+  "confidence": 0.91,
+  "class": "window",
+  "type": "Type 1",
+  "source": "template_match" | "claude_verify" | "claude_add",
+  "match_score": 0.87,
+  "scale": 1.20
 }
 ```
 
-`source` and `edit_reason` are **additive** — downstream consumers that
-expect the old schema keep working. `summary` is recomputed by the
-writer, never edited by hand.
-
-## The Claude review agent
-
-### Loop
-
-```
-state = load(response_v0)
-for attempt in range(MAX_ATTEMPTS = 3):
-    annotated = annotate(raw, state)
-    verdict   = claude_review(raw, annotated, state)
-    if verdict.status == "PERFECT": break
-    state = apply_edits(state, verdict.edits)
-save(state)
-```
-
-`verdict.status ∈ {PERFECT, NEEDS_EDIT}`. The agent stops as soon as
-Claude says the annotated image is perfect, or after 3 attempts.
-
-### Edit operations (the only things Claude can emit)
-
-Forced via tool schema. Claude never returns free-form JSON.
-
-| op             | fields                                              | meaning                                      |
-|----------------|-----------------------------------------------------|----------------------------------------------|
-| `adjust_bbox`  | `class`, `id`, `new_bbox`, `reason`                 | Tighten or shift an existing box.            |
-| `change_class` | `class`, `id`, `new_class`, `new_type`, `reason`    | Reclassify (e.g. door→window).               |
-| `change_type`  | `class`, `id`, `new_type`, `reason`                 | Keep class, fix the type label.              |
-| `delete`       | `class`, `id`, `reason`                             | False positive.                              |
-| `add`          | `class`, `bbox`, `type`, `reason`                   | Missed detection. `id` auto-assigned.        |
-
-The reconciler applies edits in this order: `delete` → `adjust_bbox` →
-`change_class` → `change_type` → `add`. New `id`s start at
-`max(existing_ids) + 1` per group.
-
-### Two-pass prompting
-
-Single-shot "review this" tends to anchor on the existing boxes. So:
-
-**Pass A — blind enumeration.** Claude sees *only* `raw_image.png`. It
-outputs a list of every opening it sees with rough bboxes in pixel
-coords and a one-line description. This is cached in agent state.
-
-**Pass B — critique & edit.** Claude sees `raw_image.png`,
-`annotated_v0.png`, `response.json (v0)`, and **its own pass-A list**.
-It emits `edits[]` as above. Having pass A on hand makes "missed
-detections" almost free to spot — it just diffs its own list against
-the JSON.
-
-**Pass C — self-check.** After edits are applied and the image is
-re-annotated, Claude sees only `annotated_v1.png` and answers
-`PERFECT` / `NEEDS_EDIT` with reasons. If `NEEDS_EDIT`, loop.
-
-### Tiling for small windows
-
-Architectural renders pack small dormer/transom windows that get lost
-at full resolution. After Pass A, compute detection density per
-512×512 tile. For any tile with ≥3 detections **or** any tile where
-HF has 0 detections but Pass A has ≥1, re-run Pass A on the
-cropped tile at native resolution. Map bboxes back via the tile
-offset. Merge into the Pass A list with NMS at IoU 0.5.
-
-This single trick is the biggest recall win. Budget: ~2–4 extra
-Claude calls per image.
-
-### Per-detection type classification
-
-`type` ("Type 1", "Type 2", ...) is hard to get right alongside
-detection. After all bbox edits are final, for every detection emit
-a separate Claude call with just the cropped bbox + the enum of
-allowed types for that class. Cheaper, more accurate, easy to cache.
-
-## Reconciliation rules
-
-Used by `apply_edits` and by tests.
-
-- **Match threshold (IoU):** windows 0.5, garage_doors 0.5, doors 0.3
-  (doors are narrow and adjacent doors get mis-matched at 0.5).
-- **Confidence after Claude edit:** keep HF confidence unless Claude
-  adjusted the bbox, in which case set `confidence = max(hf, 0.9)`
-  (Claude-confirmed boxes are high-trust).
-- **Claude-added detections:** `confidence = 0.85`, `source = "claude_add"`.
-- **Deleted detections:** dropped entirely, not soft-flagged.
-- **Summary recompute:** always derived from `detections` after edits.
-
-## Prompts (key snippets)
-
-### Pass A — blind enumeration
-
-```
-You are inspecting a {view} elevation drawing of a residential building.
-List every visible window, door, and garage door. For each, output:
-  - class: window | door | garage_door
-  - bbox: [x1, y1, x2, y2] in pixel coordinates of the original image
-  - one-line description (location + distinguishing feature)
-Do not skip small openings (dormers, transoms, sidelights). Do not list
-roof vents, skylights, or shutters as windows. Return strict JSON
-matching the schema in the tool definition.
-```
-
-### Pass B — critique & edit
-
-```
-You previously enumerated openings (PASS_A_LIST below).
-You now also see (1) the same image, (2) an annotated overlay produced
-from the model's response.json, and (3) the response.json itself.
-
-For each detection in response.json, decide:
-  - keep as-is
-  - adjust_bbox  (box is loose, shifted, or clipped)
-  - change_class (e.g. labeled door but it's a window)
-  - change_type
-  - delete       (nothing there, or it's a shutter/vent/wall feature)
-
-Then, for every item in PASS_A_LIST that has no matching detection in
-response.json (IoU < {iou}), emit an `add` edit.
-
-Output only an `edits[]` array via the submit_edits tool. No prose.
-```
-
-### Pass C — self-check
-
-```
-This annotated image was produced by applying your edits. Look at it
-fresh. Is every box tight around an actual window/door/garage door,
-with nothing missing? Reply via the verdict tool with PERFECT or
-NEEDS_EDIT plus a short reason list.
-```
-
-## Cost & latency control
-
-- **Prompt caching** on `raw_image.png` — cached once, reused across
-  passes A/B/C and every per-bbox type call. With Opus this is the
-  single biggest cost lever.
-- **Pass A tile crops** are *not* cached (one-shot per tile).
-- **Per-bbox type calls** run concurrently (asyncio.gather, bounded
-  by a semaphore of 8).
-- Hard cap: 3 review loops + tiling + N type calls = upper bound on
-  spend per image, logged to `review_meta`.
-
-## Failure modes & guards
-
-| risk                                              | guard                                                       |
-|---------------------------------------------------|-------------------------------------------------------------|
-| Claude invents detections that aren't there       | Pass C self-check on the re-annotated image must confirm.   |
-| Edit loop oscillates                              | `MAX_ATTEMPTS = 3`, then bail and keep last state.          |
-| Bbox coords drift out of image bounds             | Clamp in `apply_edits`; reject zero-area boxes.             |
-| Class enum violations                             | Pydantic validation on tool input rejects the edit.         |
-| HF endpoint flaky                                 | Cache v0 response on disk keyed by image hash.              |
-| Top-view image sneaks in                          | A 1-call view classifier up front; refuse if `top`.         |
-
-## Observability
-
-Every run writes `review_meta` into the final JSON:
+Plus a top-level `review_meta`:
 
 ```json
 "review_meta": {
-  "model": "claude-opus-4-7",
-  "attempts": 2,
-  "edits_applied": {"adjust_bbox": 3, "add": 2, "delete": 1},
-  "tiles_inspected": 4,
-  "final_verdict": "PERFECT",
-  "elapsed_ms": 18234,
-  "input_image_sha256": "..."
+  "pipeline": "template_match_v1",
+  "tier1_candidates": 14,
+  "tier1_kept": 12,
+  "tier2_calls": 1,
+  "tier2_added": 0,
+  "elapsed_ms": 142,
+  "input_sha256": "..."
 }
 ```
 
-Plus, every loop iteration is dumped to `runs/{sha}/iter_{n}/` with
-`annotated.png`, `response.json`, and the raw Claude tool calls. This
-becomes the fine-tuning dataset for the HF model later.
+## Test plan
+
+Using the sample payload you uploaded (4 windows, 4 doors, 4 garage doors
+expected), the harness asserts:
+
+- `test_matcher`: each template fires ≥1 hit on the sample, no class
+  cross-contamination (window template doesn't match a garage door).
+- `test_nms`: 60 raw candidates collapse to ≤16 detections.
+- `test_end_to_end`: final `response.json` matches the HF response
+  within IoU 0.5 per detection, **for all 12 expected objects**, and
+  has zero false positives.
+
+Tier 2 is mocked in tests; a separate `test_tier2_integration.py`
+hits the real Claude API and is opt-in via env var.
 
 ## Milestones
 
-1. **M1 — Skeleton + annotate.** Stubs land, `annotate(raw, json)`
-   works end-to-end on the fixture you provided. *(half day)*
-2. **M2 — Single-pass review.** Pass B only, no tiling, no self-check.
-   Proves the SDK wiring and edit schema. *(1 day)*
-3. **M3 — Three-pass loop.** Add Pass A + Pass C + retry loop. *(1 day)*
-4. **M4 — Tiling.** Density-based tile selection + NMS merge. *(half day)*
-5. **M5 — Per-bbox type classifier.** Concurrent calls + caching. *(half day)*
-6. **M6 — Eval harness.** Score against a hand-labelled set of ~20
-   images. Track precision/recall per class vs HF baseline. *(1 day)*
+1. **M1 — Payload decode + preprocess.** `payload.py`, `preprocess.py`,
+   tests load the fixture and dump grayscale/edge images for visual
+   inspection. *(½ day)*
+2. **M2 — Multi-scale matcher + NMS.** `matcher.py`. Run on fixture,
+   visualize all 12 expected detections. *(1 day)*
+3. **M3 — Assemble response.json.** `assemble.py`, schema validation,
+   end-to-end test green on fixture. *(½ day)*
+4. **M4 — Coverage check + Tier 2 verifier.** `coverage.py`,
+   `verifier.py`, prompt-tuning on 1–2 hard examples. *(1 day)*
+5. **M5 — Eval harness.** Score on 20 hand-labelled images vs current
+   HF baseline. Track precision/recall per class. *(1 day)*
+6. **M6 — CLI + packaging.** `examples/run_detect.py`, README, ready to
+   wire into your service. *(½ day)*
 
-M2 alone should already beat the HF baseline noticeably; everything
-after that is squeezing out the last 15–20% of recall.
+M2 alone should already match or beat the HF baseline on simple
+elevations. Tier 2 is what closes the gap on edge cases.
+
+## Failure modes & guards
+
+| risk                                          | guard                                                                |
+|-----------------------------------------------|----------------------------------------------------------------------|
+| Window drawn outside 0.7–1.4× template scale  | Coverage check catches it as suspect region → Tier 2.                |
+| Future image has a window type not in payload | Same — Tier 2 sweeps for uncovered openings.                          |
+| Alpha channel is opaque (no real mask)        | Fallback to Otsu binarization of template; logged.                    |
+| Template matches a shutter or roof tile       | Tier 2 low-score confirm rejects it before it enters response.json.   |
+| Top-view image sneaks in                      | Single Claude call at start classifies view; refuse if `top`.         |
+| matchTemplate OOM on huge images              | Tile building image into 1024-wide strips with 200 px overlap.        |
+
+## What this plan deliberately omits
+
+- No SAM 2, no Grounding DINO, no fine-tuning. The templates make those
+  unnecessary at this scale.
+- No replacement of the HF endpoint; the new pipeline runs *instead of*
+  calling it. The old reviewer-on-top-of-HF plan in git history
+  (`DESIGN.md` at commit `1ceeaa1`) is superseded.
+
+## Open questions
+
+1. Is the alpha channel of the template crops a true mask (transparent
+   background) or is it fully opaque RGBA?
+2. Are templates always supplied per request, or sometimes missing?
+3. How many distinct types does each class actually have in production
+   (the sample has only Type 1 for everything)?
